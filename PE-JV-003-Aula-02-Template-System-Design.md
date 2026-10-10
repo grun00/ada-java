@@ -80,4 +80,30 @@ Dependemos de uma API terceira instável. Quais recursos do padrão de resiliên
 ## 4. Testando a Resiliência
 
 - **Estratégia:** Como você vai garantir que o Circuit Breaker abre na hora certa e o Timeout não deixa a Thread presa?
-  > [Sua resposta aqui. Exemplo: simular latência de 10s no parceiro usando XYZ...]
+  > A estratégia usa **testes em camadas**, do mais rápido e barato para o mais realista:
+  >
+  > | Camada | Ferramentas | O que valida |
+  > |---|---|---|
+  > | **Unitário** | JUnit 5 + Reactor `StepVerifier` (com tempo virtual) | Regras do Retry (quais erros repetem e quais não), Circuit Breaker abrindo nos limites configurados, timeout em 3 s |
+  > | **Integração** | WireMock (simula o parceiro) + Testcontainers (Redis e Postgres reais) + BlockHound | Comportamento com latência e erros reais do parceiro, idempotência com requisições simultâneas, nenhuma chamada bloqueante no event loop |
+  > | **Carga** | Gatling ou k6 | 10 mil usuários simultâneos, uso de memória e threads, tempos de resposta (p95/p99) |
+  > | **Caos** | Toxiproxy + derrubar containers durante o teste de carga | Latência e queda de rede, queda do Redis e do parceiro (edge cases da seção 3) |
+  >
+  > **1. O Circuit Breaker abre na hora certa:**
+  > - Configurar o WireMock para responder `500` em 60% das chamadas e enviar 100 requisições (o tamanho da janela).
+  > - Verificar pelo `CircuitBreakerRegistry` que o estado mudou para `OPEN` depois da janela, e não antes.
+  > - Verificar que, com o circuito aberto, as chamadas seguintes falham com `CallNotPermittedException` **sem chegar ao WireMock** (`verify(0, postRequestedFor(...))`).
+  > - Avançar o tempo e verificar a passagem para `HALF_OPEN`: com o parceiro saudável, o circuito volta para `CLOSED`; com o parceiro ainda falhando, volta para `OPEN`.
+  > - Repetir o teste com chamadas lentas (atraso de 2,5 s) para validar a regra de chamadas lentas.
+  >
+  > **2. O timeout não deixa a thread presa:**
+  > - Simular **latência de 10 s** no parceiro com `withFixedDelay(10_000)` no WireMock (ou um *toxic* de latência no Toxiproxy).
+  > - Verificar que a chamada termina com `TimeoutException` em aproximadamente **3 s**, e não em 10 s. No teste unitário, usar `StepVerifier.withVirtualTime` para isso não levar 3 s reais.
+  > - Verificar que a conexão HTTP foi cancelada e devolvida ao pool (métricas do Reactor Netty).
+  > - Rodar os testes com o **BlockHound** ativo: qualquer chamada bloqueante no event loop faz o teste falhar.
+  > - No teste de carga com o parceiro lento, verificar pelo Micrometer/Actuator que o número de threads continua estável (aproximadamente o número de núcleos) e que a memória não cresce sem limite.
+  >
+  > **3. Critérios de aceite:**
+  > - Nenhuma cobrança duplicada em 1.000 requisições simultâneas com a mesma `Idempotency-Key`: apenas 1 chamada chega ao WireMock e todas as respostas são iguais.
+  > - Com 10 mil usuários e o parceiro saudável: p99 abaixo de 1 s e taxa de erro abaixo de 0,1%.
+  > - Com o parceiro fora do ar: o Circuit Breaker abre em menos de 30 s, a API responde rápido (`503`) e nenhum pedido fica sem status final depois da reconciliação.
