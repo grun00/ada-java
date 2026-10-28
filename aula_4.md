@@ -20,7 +20,7 @@
   > **Resumo:** o 2PC garante consistência imediata, mas cobra caro em bloqueio e disponibilidade. Neste cenário, esse custo é alto demais.
   >
   > **Quando ACID local ou 2PC resolveria com menor custo:**
-  > - **Um único banco (monólito modular):** se Checkout, Pagamento e Estoque usassem o mesmo PostgreSQL, como na Aula 03, um `@Transactional` local bastaria: pedido, reserva e registro do pagamento são gravados juntos, ou nada é gravado. É a solução mais simples e deve ser a primeira considerada. Bancos autônomos só se justificam quando a escala e a organização dos times exigem.
+  > - **Um único banco (monólito modular):** se Checkout, Pagamento e Estoque usassem o mesmo PostgreSQL, como na Aula 03, transações locais bastariam: pedido e reserva são gravados juntos numa transação, e o registro do pagamento em outra, no mesmo banco, sem mensageria nem Saga entre serviços. É a solução mais simples e deve ser a primeira considerada. Bancos autônomos só se justificam quando a escala e a organização dos times exigem.
   > - **2PC (XA via JTA, ex.: Narayana ou Atomikos):** faz sentido com poucos participantes, todos controlados pela empresa e com suporte a XA, na mesma rede, com baixo volume e transações curtas. Ex.: um processo interno de back-office que grava em dois bancos.
   >
   > **Por que o 2PC é inviável aqui:**
@@ -75,8 +75,8 @@
   > ```
   >
   > - **Inicial:** `CRIADO`: pedido gravado com os itens e o valor revalidados.
-  > - **Intermediários:** `RESERVANDO_ESTOQUE` (comando enviado ao Estoque); `AGUARDANDO_PAGAMENTO` (unidade reservada por 10 min e QR Code Pix emitido); `CONFIRMANDO_ESTOQUE` (pagamento aprovado; a reserva vira baixa definitiva).
-  > - **De compensação:** `LIBERANDO_ESTOQUE` (pagamento recusado ou QR Code expirado; devolve a unidade); `ESTORNANDO_PAGAMENTO` (dinheiro recebido, mas o estoque não foi confirmado; devolve o Pix).
+  > - **Intermediários:** `RESERVANDO_ESTOQUE` (comando enviado ao Estoque); `AGUARDANDO_PAGAMENTO` (unidade reservada por 10 min no Estoque e QR Code Pix emitido com validade de 15 min; a reserva é mais curta de propósito, para não prender unidades escassas na Black Friday, e o risco de pagamento depois do fim da reserva é coberto pela compensação abaixo); `CONFIRMANDO_ESTOQUE` (pagamento aprovado; a reserva vira baixa definitiva).
+  > - **De compensação:** `LIBERANDO_ESTOQUE` (pagamento recusado ou QR Code expirado aos 15 min; devolve a unidade, se ainda estiver reservada); `ESTORNANDO_PAGAMENTO` (dinheiro recebido, mas o estoque não foi confirmado; devolve o Pix).
   > - **Finais:** `CONCLUIDO` (sucesso); `CANCELADO` (nenhum dinheiro retido); `CANCELADO_ESTORNADO` (dinheiro devolvido ao cliente).
   > - **Implementação:** um `enum` com o mapa de transições permitidas. Toda mudança passa por `transicionar(evento)`, que rejeita transições inválidas. Um evento repetido para um estado já alcançado é ignorado (idempotência, como na Aula 03). Cada estado intermediário tem um **prazo**; um job busca sagas vencidas com um índice parcial `ON saga_instance (prazo) WHERE estado NOT IN ('CONCLUIDO', 'CANCELADO', 'CANCELADO_ESTORNADO')` e reenvia o comando ou inicia a compensação.
 - **Detalhamento dos Fluxos:**
@@ -92,7 +92,7 @@
   > 7. **Checkout:** passa para `CONCLUIDO` e publica `PedidoConcluido`, consumido por logística, notificação e pelo modelo de leitura.
   >
   > **Caminho de falha: estoque rejeitado após o Pix aprovado**
-  > 1. O cliente paga o Pix no minuto 12; a reserva expirou no minuto 10 e o job da Aula 03 devolveu a unidade, que já foi vendida.
+  > 1. O cliente paga o Pix no minuto 12, dentro da validade do QR Code (15 min); a reserva expirou no minuto 10 e o job da Aula 03 devolveu a unidade, que já foi vendida.
   > 2. **Pagamento** grava `PAGO` e responde `PagamentoAprovado`. **Checkout** passa para `CONFIRMANDO_ESTOQUE` e envia `ConfirmarReserva`.
   > 3. **Estoque** encontra a reserva expirada, tenta reservar de novo com o mesmo `UPDATE` condicional e obtém 0 linhas afetadas. Responde `EstoqueIndisponivel`. É uma falha de negócio definitiva, então não há retry.
   > 4. **Checkout**, na mesma transação local: passa para `ESTORNANDO_PAGAMENTO` e grava na outbox o comando `EstornarPagamento(orderId, valor, idEstorno = "estorno-" + orderId)`.

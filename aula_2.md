@@ -4,15 +4,21 @@
 
 ## 1. Escolha de Paradigma da API
 
-- **A Escolha:** ( ) Spring MVC com Virtual Threads ou (x) Spring WebFlux (Reativo)?
+- **A Escolha:** (x) Spring MVC com Virtual Threads ou ( ) Spring WebFlux (Reativo)?
 - **Justificativa:** Considerando a capacidade de suportar 10k acessos concorrentes, por que você fez essa escolha técnica?
-  > Escolhi o **Spring WebFlux** por três motivos:
+  > Escolhi **Spring MVC com Virtual Threads** (Java 25, `spring.threads.virtual.enabled=true`) por três motivos:
   >
-  > 1. **Poucas threads para muitas conexões:** o WebFlux usa um event loop (Netty) com aproximadamente uma thread por núcleo de CPU. As 10 mil requisições simultâneas ficam esperando a resposta do parceiro de pagamento sem ocupar uma thread cada, o que mantém o uso de memória baixo e previsível.
-  > 2. **Backpressure:** o consumidor controla o ritmo em que recebe os dados. Se o parceiro de pagamento ficar lento, a aplicação consegue limitar e enfileirar a demanda de forma controlada (por exemplo, com `limitRate` e limites de concorrência em `flatMap`), em vez de acumular trabalho sem controle até esgotar a memória.
-  > 3. **Stack reativa de ponta a ponta:** a chamada ao parceiro usa `WebClient`, a persistência usa R2DBC (Postgres) e o controle de idempotência usa Redis Reactive. Como nenhuma etapa bloqueia, o event loop nunca fica travado. Além disso, o Resilience4j tem operadores próprios para Reactor (`CircuitBreakerOperator`, `RetryOperator`, `BulkheadOperator`, `RateLimiterOperator`).
+  > 1. **Muitas requisições sem muitas threads do sistema:** cada requisição roda numa virtual thread, que custa poucos KB. Enquanto espera o parceiro, ela é desmontada da thread do sistema (*carrier*), e a JVM usa cerca de uma carrier por núcleo. As 10 mil requisições esperando não ocupam 10 mil threads do sistema operacional.
+  > 2. **Código imperativo e ecossistema completo:** JDBC/HikariCP, JPA (`@Version`/`@Lock` da Aula 03), `@Transactional`, Flyway, `RestClient` e Resilience4j por anotações. Stack traces legíveis e depuração normal.
+  > 3. **Java 24+ (JEP 491):** `synchronized` não prende mais a virtual thread à carrier, o que eliminou a principal causa de *pinning* das versões 21 a 23.
   >
-  > **Trade-offs aceitos:** a curva de aprendizado é maior, o código com `Mono`/`Flux` é mais difícil de ler e debugar e não dá para usar JPA/JDBC. Para reduzir esses riscos, a regra é **nenhuma chamada bloqueante no event loop**, verificada com o BlockHound nos testes. Se algum trecho bloqueante for inevitável, ele roda em `Schedulers.boundedElastic()`.
+  > **Por que não WebFlux:** a vantagem do WebFlux era não bloquear threads. Com virtual threads, bloquear ficou barato, e essa vantagem deixa de existir num fluxo de pedido e resposta como o checkout. O WebFlux exigiria R2DBC (sem JPA), código `Mono`/`Flux` mais difícil de ler e depurar, e cuidado constante para não bloquear o event loop. Ele continua melhor para streaming com muitas conexões longas e backpressure de ponta a ponta, o que não é o caso aqui.
+  >
+  > **Trade-offs e mitigação:**
+  > - **Não há backpressure automático:** é possível criar virtual threads sem limite, e o gargalo passa para os recursos finitos (pool do HikariCP, conexões HTTP, cota do parceiro). Limito de forma explícita com Bulkhead, RateLimiter e o limite de conexões do Tomcat (`server.tomcat.max-connections`, `accept-count`).
+  > - **O pool do banco é o limite real:** 10 mil virtual threads disputam dezenas de conexões. Uso `connectionTimeout` curto no HikariCP e Bulkhead antes do acesso ao banco.
+  > - ***Pinning* restante:** chamadas nativas ainda podem prender a carrier. Monitoro com o evento JFR `jdk.VirtualThreadPinned`.
+  > - **`ThreadLocal`:** com uma thread por requisição, evito caches grandes em `ThreadLocal` e uso `ScopedValue` quando preciso.
 
 ## 2. Desenho de Resiliência
 
@@ -24,7 +30,7 @@ Dependemos de uma API terceira instável. Quais recursos do padrão de resiliên
   >
   > | Padrão | Problema que resolve | Configuração inicial |
   > |---|---|---|
-  > | **TimeLimiter** (timeout) | Parceiro lento prendendo conexões indefinidamente | `responseTimeout` de 3 s no `WebClient` + `timeout(3s)` no Reactor |
+  > | **TimeLimiter** (timeout) | Parceiro lento prendendo conexões indefinidamente | `connectTimeout` de 1 s e `readTimeout` de 3 s no `RestClient`; TimeLimiter do Resilience4j como limite da operação inteira |
   > | **Circuit Breaker** | Continuar chamando um parceiro que já está fora do ar | Abre com 50% de falhas **ou** 50% de chamadas lentas (> 2 s) em uma janela de 100 chamadas; fica aberto 30 s; em seguida libera 10 chamadas de teste (half-open) |
   > | **Bulkhead** | Uma dependência lenta consumir todos os recursos da aplicação | Máximo de 200 chamadas simultâneas ao parceiro; as demais falham rápido |
   > | **RateLimiter** | Ultrapassar a cota contratada com o parceiro (e receber HTTP 429) | Limite igual à cota do contrato, por exemplo 500 req/s |
@@ -67,7 +73,7 @@ Cole aqui as 3 perguntas de risco que você formulou e defina como a arquitetura
      - Se a mesma requisição for reenviada nesse meio-tempo, recebe o status atual (`PENDENTE`), nunca uma nova cobrança.
 2. **E se...** o **Redis** usado para controlar a idempotência **ficar fora do ar**?
    - **Resposta do Sistema:** a regra é **não cobrar sem garantia de idempotência** (fail closed: na dúvida, bloquear).
-     - A API passa a usar a segunda barreira: a restrição `UNIQUE` em `idempotency_key` na tabela de pedidos do Postgres (via R2DBC). O pedido é inserido **antes** de chamar o parceiro; se a chave já existir, a inserção falha e a API devolve o pedido existente em vez de cobrar.
+     - A API passa a usar a segunda barreira: a restrição `UNIQUE` em `idempotency_key` na tabela de pedidos do Postgres (via JDBC). O pedido é inserido **antes** de chamar o parceiro; se a chave já existir, a inserção falha e a API devolve o pedido existente em vez de cobrar.
      - Se o Postgres também estiver indisponível, a API responde `503 Service Unavailable` com `Retry-After`, e o cliente reenvia depois com a mesma chave.
      - As chamadas ao Redis também têm timeout curto (por exemplo, 200 ms) e um Circuit Breaker próprio, para que a queda do Redis não deixe as requisições esperando.
      - Um alerta é disparado para o time de plantão, porque o sistema está funcionando com menos proteção.
@@ -75,7 +81,7 @@ Cole aqui as 3 perguntas de risco que você formulou e defina como a arquitetura
    - **Resposta do Sistema:** o sistema deve **degradar de forma controlada**, sem cair por completo.
      - O **TimeLimiter** encerra as chamadas lentas em 3 s, para que as conexões não se acumulem.
      - O **Bulkhead** (200 chamadas simultâneas) e o **RateLimiter** (cota do parceiro) recusam o excesso imediatamente, sem consumir recursos.
-     - O **backpressure** do WebFlux, junto com um limite de conexões no Netty, impede que a fila de requisições cresça sem controle e esgote a memória.
+     - O **limite de conexões do Tomcat** (`max-connections`/`accept-count`) e o Bulkhead fazem o papel do backpressure: o excesso é recusado na entrada, em vez de virar milhares de virtual threads esperando o mesmo recurso e esgotando a memória.
      - As requisições recusadas recebem `503` ou `429` com `Retry-After`, e o front-end mostra "tente novamente em instantes", sem cobrar.
      - Se a lentidão passar do limite de chamadas lentas, o **Circuit Breaker** abre e protege o parceiro e a aplicação. Enquanto isso, o autoscaling sobe novas instâncias da API para atender o tráfego que não depende do parceiro.
 
@@ -86,8 +92,8 @@ Cole aqui as 3 perguntas de risco que você formulou e defina como a arquitetura
   >
   > | Camada | Ferramentas | O que valida |
   > |---|---|---|
-  > | **Unitário** | JUnit 5 + Reactor `StepVerifier` (com tempo virtual) | Regras do Retry (quais erros repetem e quais não), Circuit Breaker abrindo nos limites configurados, timeout em 3 s |
-  > | **Integração** | WireMock (simula o parceiro) + Testcontainers (Redis e Postgres reais) + BlockHound | Comportamento com latência e erros reais do parceiro, idempotência com requisições simultâneas, nenhuma chamada bloqueante no event loop |
+  > | **Unitário** | JUnit 5 + Resilience4j com configuração de teste (janelas e timeouts curtos) | Regras do Retry (quais erros repetem e quais não), Circuit Breaker abrindo nos limites configurados, timeout em 3 s |
+  > | **Integração** | WireMock (simula o parceiro) + Testcontainers (Redis e Postgres reais) + JFR (`jdk.VirtualThreadPinned`) gravado durante o teste | Comportamento com latência e erros reais do parceiro, idempotência com requisições simultâneas, nenhuma virtual thread presa à carrier |
   > | **Carga** | Gatling ou k6 | 10 mil usuários simultâneos, uso de memória e threads, tempos de resposta (p95/p99) |
   > | **Caos** | Toxiproxy + derrubar containers durante o teste de carga | Latência e queda de rede, queda do Redis e do parceiro (edge cases da seção 3) |
   >
@@ -100,10 +106,10 @@ Cole aqui as 3 perguntas de risco que você formulou e defina como a arquitetura
   >
   > **2. O timeout não deixa a thread presa:**
   > - Simular **latência de 10 s** no parceiro com `withFixedDelay(10_000)` no WireMock (ou um *toxic* de latência no Toxiproxy).
-  > - Verificar que a chamada termina com `TimeoutException` em aproximadamente **3 s**, e não em 10 s. No teste unitário, usar `StepVerifier.withVirtualTime` para isso não levar 3 s reais.
-  > - Verificar que a conexão HTTP foi cancelada e devolvida ao pool (métricas do Reactor Netty).
-  > - Rodar os testes com o **BlockHound** ativo: qualquer chamada bloqueante no event loop faz o teste falhar.
-  > - No teste de carga com o parceiro lento, verificar pelo Micrometer/Actuator que o número de threads continua estável (aproximadamente o número de núcleos) e que a memória não cresce sem limite.
+  > - Verificar que a chamada termina com erro de timeout em aproximadamente **3 s**, e não em 10 s. No teste unitário, configurar um timeout curto (ex.: 300 ms) para o teste não levar 3 s reais.
+  > - Verificar que a conexão HTTP foi encerrada e devolvida ao pool (métricas do pool de conexões do cliente HTTP).
+  > - Rodar os testes com o **JFR** gravando: qualquer evento `jdk.VirtualThreadPinned` acima de 20 ms faz o teste falhar.
+  > - No teste de carga com o parceiro lento, verificar pelo Micrometer/Actuator que as carriers continuam estáveis (aproximadamente o número de núcleos), que as virtual threads ativas ficam limitadas pelo Bulkhead e que a memória não cresce sem limite.
   >
   > **3. Critérios de aceite:**
   > - Nenhuma cobrança duplicada em 1.000 requisições simultâneas com a mesma `Idempotency-Key`: apenas 1 chamada chega ao WireMock e todas as respostas são iguais.

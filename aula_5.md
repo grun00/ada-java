@@ -106,9 +106,28 @@
   > SET lock_timeout = '3s';
   > ALTER TABLE pedido ADD COLUMN estado_saga VARCHAR(30) NULL;
   > ALTER TABLE pedido ALTER COLUMN status_pagamento DROP NOT NULL;
+  >
+  > CREATE FUNCTION sync_estado_saga() RETURNS trigger AS $$
+  > BEGIN
+  >   IF TG_OP = 'INSERT' THEN
+  >     NEW.estado_saga      := COALESCE(NEW.estado_saga, NEW.status_pagamento);
+  >     NEW.status_pagamento := COALESCE(NEW.status_pagamento, NEW.estado_saga);
+  >   ELSIF NEW.status_pagamento IS DISTINCT FROM OLD.status_pagamento
+  >         AND NEW.estado_saga IS NOT DISTINCT FROM OLD.estado_saga THEN
+  >     NEW.estado_saga := NEW.status_pagamento;   -- v1 alterou só a coluna antiga
+  >   ELSIF NEW.estado_saga IS DISTINCT FROM OLD.estado_saga
+  >         AND NEW.status_pagamento IS NOT DISTINCT FROM OLD.status_pagamento THEN
+  >     NEW.status_pagamento := NEW.estado_saga;   -- v3 alterou só a coluna nova
+  >   END IF;
+  >   RETURN NEW;
+  > END $$ LANGUAGE plpgsql;
+  >
+  > CREATE TRIGGER trg_sync_estado_saga
+  >   BEFORE INSERT OR UPDATE ON pedido
+  >   FOR EACH ROW EXECUTE FUNCTION sync_estado_saga();
   > ```
   > - No PostgreSQL 11+, adicionar uma coluna nula sem `DEFAULT` altera só o catálogo: é instantâneo, sem reescrever a tabela.
-  > - Crio um *trigger* `BEFORE INSERT OR UPDATE` que copia o valor de uma coluna para a outra quando só uma for preenchida. Assim, tudo o que a v1 grava (só em `status_pagamento`) também aparece em `estado_saga`.
+  > - O *trigger* `trg_sync_estado_saga` mantém as duas colunas sincronizadas nos dois sentidos. No `INSERT`, preenche a coluna que veio vazia; no `UPDATE`, copia a coluna que mudou para a outra; se a v2 gravou as duas, não interfere. Sem comparar `OLD` com `NEW`, uma atualização da v1 depois do backfill deixaria `estado_saga` com o valor antigo.
   > - A v1 continua funcionando sem mudança nenhuma: o Hibernate lista as colunas explicitamente no SQL e ignora a coluna nova.
   >
   > **Release 2: Migrate (aplicação v2 com escrita dupla + backfill)**
@@ -215,6 +234,7 @@
   >     var pedidoV1 = criarPedido(v1);           // v1 grava só status_pagamento
   >     var pedidoV2 = criarPedido(v2);           // v2 grava as duas colunas
   >     avancarSaga(v2, pedidoV1);                // v2 atualiza pedido criado pela v1
+  >     avancarSaga(v1, pedidoV2);                // v1 atualiza só status_pagamento em pedido criado pela v2
   >
   >     assertThat(jdbc.queryForObject("""
   >         SELECT count(*) FROM pedido

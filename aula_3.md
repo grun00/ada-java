@@ -21,7 +21,7 @@
   > **Dados financeiros ficam no PostgreSQL; o resto vai para o banco mais adequado a cada uso.**
   >
   > - **Teorema CAP:** quando há uma falha de rede entre servidores (partição), o sistema precisa escolher entre consistência e disponibilidade. Para pedido, pagamento e baixa de estoque, a escolha é **consistência (CP)**: é melhor recusar um pedido por alguns segundos do que vender um item sem estoque ou cobrar duas vezes.
-  > - **ACID no núcleo:** pedido, itens, pagamento e reserva de estoque são gravados **na mesma transação** no PostgreSQL (um único servidor primário de escrita). Ou tudo é gravado, ou nada é. Restrições do banco (`UNIQUE` na `idempotency_key`, `CHECK (disponivel >= 0)`, chaves estrangeiras) são a última barreira contra dados inválidos.
+  > - **ACID no núcleo:** pedido, itens e reserva de estoque são gravados **na mesma transação** no PostgreSQL (um único servidor primário de escrita). Ou tudo é gravado, ou nada é. O pagamento é registrado depois, em outra transação curta, porque depende da resposta do parceiro externo e não pode segurar locks enquanto espera (seção 2.2). Restrições do banco (`UNIQUE` na `idempotency_key`, `CHECK (disponivel >= 0)`, chaves estrangeiras) são a última barreira contra dados inválidos.
   > - **BASE na periferia:** catálogo e sessões aceitam **consistência eventual** (o dado pode ficar alguns segundos desatualizado) em troca de alta vazão de leitura e disponibilidade (AP). Ficam em cache (Redis) e em réplicas de leitura.
   > - **Por que não compromete a integridade:** nenhum dado eventual decide dinheiro. O preço e o estoque exibidos vêm do cache, mas no momento do checkout são **revalidados no PostgreSQL** dentro da transação.
   > - **Por que não Relacional Puro:** colocar sessões, carrinhos e consultas de catálogo no mesmo PostgreSQL consumiria conexões e I/O justamente do fluxo financeiro, no pico da Black Friday.
@@ -143,6 +143,7 @@ Analise e defina a abordagem de concorrência para os dois fluxos críticos do n
   > ```
   > - `customer_id` vem primeiro porque é muito seletivo e porque o índice também atende a consulta só por cliente.
   > - O índice parcial cobre a fila de `processing`, que é uma pequena fração da tabela.
+  > - **Custo assumido:** os dois índices também envolvem `order_status` (o composto como coluna, o parcial no `WHERE`), então as mudanças de status também deixam de ser atualizações HOT. Aceito esse custo porque são só 2 índices escolhidos pelas consultas reais, e não um por coluna, e porque eles transformam uma leitura de segundos em milissegundos. Para limitar o impacto, uso `fillfactor = 90` na tabela, para que as atualizações que não mexem em colunas indexadas continuem HOT, e acompanho `n_tup_hot_upd` em `pg_stat_user_tables` depois do deploy.
   >
   > **Condições para aprovar:**
   > - `EXPLAIN (ANALYZE, BUFFERS)` antes e depois anexado ao PR, mais o resultado do teste de carga.
