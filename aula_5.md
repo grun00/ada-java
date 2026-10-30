@@ -82,6 +82,12 @@
   >
   > **Sinais de avanço e rollback automático** (`AnalysisTemplate` com consultas ao Prometheus, comparando canary com a versão estável no mesmo intervalo):
   > - **Técnicos:** taxa de 5xx do canary no máximo 0,5 ponto percentual acima da estável; p99 até 1,2× o da estável; conexões pendentes no HikariCP perto de zero; pausas de GC; reinícios de pod; erros de SQL (`column does not exist` encerra o rollout na hora).
+  > - **Travamento sem erro (Aula 06):** 5xx e p99 só enxergam requisições que terminaram. Por isso a análise também compara canary e estável em:
+  >   - `http.server.requests.active` (normalizado pelo tráfego) e a idade da requisição mais antiga. Acima do `request-timeout` de 3 s da Aula 02, o rollout é abortado.
+  >   - Taxa de timeouts nas consultas síncronas ao Pagamento e ao Estoque e de conexões encerradas pelo cliente.
+  >   - Fração de checkouts dentro do SLO de 1 s (*burn rate*, Aula 06).
+  >   - Pedidos concluídos por segundo, proporcionais ao peso do canary.
+  >   - Um checkout sintético direcionado ao canary (*baggage* `canary=true`) a cada 30 s.
   > - **De negócio (da Aula 04):** taxa de compensação da Saga, pedidos parados no mesmo estado além do prazo, lag do consumidor Kafka, mensagens na DLQ e taxa de aprovação do checkout.
   > - Duas medições ruins seguidas → `abort` automático: o peso volta a 0% em segundos, sem esperar alguém.
   >
@@ -95,6 +101,8 @@
 ### 2.2 Evolução de Schema Sem Downtime e Plano de Rollback
 
 - **Passo a Passo da Migração:** Descreva em etapas sequenciais como evoluir a coluna `status_pagamento` para `estado_saga` no PostgreSQL garantindo que as instâncias da versão antiga (`v1`) e da versão nova (`v2`) operem juntas sem erros de SQL.
+  > **Contexto do modelo:** `pedido` é a tabela de pedidos do Checkout (a `orders` do enunciado da Aula 03). Apesar do nome, `status_pagamento` sempre guardou o estado da máquina de estados da Aula 04 (`CRIADO`, `AGUARDANDO_PAGAMENTO`, `CONCLUIDO`…). Por isso a mudança é só de nome, para `estado_saga`, e os valores não mudam. É isso que permite ao trigger copiar o valor de uma coluna para a outra sem nenhuma conversão.
+  >
   > **Regras gerais (o que causou o incidente):**
   > - **Nunca renomear coluna em uma única etapa.** `RENAME COLUMN` é uma mudança destrutiva para qualquer instância que ainda use o nome antigo. Uso **Expand and Contract** (*Parallel Change*), dividido em várias releases.
   > - **Migração fora do boot da aplicação.** Nos pods, `spring.flyway.enabled=false`. O Flyway roda como um `Job` do Kubernetes (hook *PreSync* do Argo CD), uma única vez, com um usuário de banco que tem permissão de DDL. A aplicação usa um usuário só com DML (seção 3.1).
@@ -132,7 +140,7 @@
   >
   > **Release 2: Migrate (aplicação v2 com escrita dupla + backfill)**
   > - A **v2 grava nas duas colunas** e lê `estado_saga` (com `COALESCE(estado_saga, status_pagamento)` até o backfill terminar).
-  > - **Backfill em lotes** por um job separado: `UPDATE pedido SET estado_saga = status_pagamento WHERE id BETWEEN ? AND ? AND estado_saga IS NULL`, em lotes de 5 mil linhas, com pausa entre eles e fora do pico. Isso evita transações longas, picos de WAL e atraso nas réplicas de leitura (Aula 03).
+  > - **Backfill em lotes** por um job separado: `UPDATE pedido SET estado_saga = status_pagamento WHERE id IN (SELECT id FROM pedido WHERE id > :ultimo AND estado_saga IS NULL ORDER BY id LIMIT 5000) RETURNING id`, avançando `:ultimo` para o maior `id` do lote (paginação por chave, possível porque o UUIDv7 da Aula 03 é ordenado), com pausa entre eles e fora do pico. Isso evita transações longas, picos de WAL e atraso nas réplicas de leitura (Aula 03).
   > - **Verificação:** `SELECT count(*) FROM pedido WHERE estado_saga IS DISTINCT FROM status_pagamento` precisa retornar 0.
   > - **Restrição sem travar:** `ADD CONSTRAINT ck_estado_saga CHECK (estado_saga IS NOT NULL) NOT VALID` e depois `VALIDATE CONSTRAINT`, que não bloqueia escritas. Índices na coluna nova com `CREATE INDEX CONCURRENTLY`, em script com `executeInTransaction=false` (arquivo `.conf` do Flyway).
   > - v1 e v2 convivem durante o canary sem erro de SQL: as duas colunas existem e estão sempre sincronizadas.
@@ -241,11 +249,11 @@
   >         WHERE estado_saga IS DISTINCT FROM status_pagamento""", Long.class)).isZero();
   >
   >     v2.stop();                                // simula o rollback
-  >     assertThat(consultarStatus(v1, pedidoV2)).isEqualTo("PAGO");
+  >     assertThat(consultarStatus(v1, pedidoV2)).isEqualTo("AGUARDANDO_PAGAMENTO"); // estado gravado após avancarSaga(v1, pedidoV2)
   >     assertThat(logs(v1)).doesNotContain("does not exist");
   > }
   > ```
   > - O teste falha se a v2 depender de algo que a v1 não tem, ou se a migração quebrar a v1. É exatamente o cenário do incidente, reproduzido na esteira.
   >
   > **Etapa 5: ensaio do canary em staging**
-  > - Deploy pelo Argo Rollouts em staging com carga sintética (k6/Gatling) e um build propositalmente defeituoso (flag que injeta erros 5xx), para provar que a análise automática executa o `abort` e devolve o tráfego para a v1. Só então a promoção para produção fica liberada.
+  > - Deploy pelo Argo Rollouts em staging com carga sintética (k6/Gatling) e dois builds propositalmente defeituosos: um que injeta erros 5xx e outro que injeta **30 s de atraso sem erro** na chamada ao Pagamento (o incidente da Aula 06), para provar que a análise automática executa o `abort` nos dois casos e devolve o tráfego para a v1. Só então a promoção para produção fica liberada.

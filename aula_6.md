@@ -44,6 +44,8 @@
   > 3. **Saída:** o `RestClient` ou `WebClient` **criado a partir do `Builder` injetado pelo Spring** já vem instrumentado e escreve o `traceparent` com um novo `span_id` filho. Um `new RestTemplate()` criado à mão não propaga nada; é o erro mais comum, e o teste da seção 4 o detecta.
   > 4. **Do outro lado:** Pagamento e Estoque usam a mesma configuração, continuam o mesmo `trace_id` e respondem com ele nos logs.
   >
+  > **Dois caminhos, o mesmo `trace_id` (Aula 04):** as consultas síncronas do Checkout ao Pagamento e ao Estoque levam o `traceparent` no cabeçalho HTTP; os comandos da Saga o levam nos headers do Kafka. O trace de um checkout cobre os dois caminhos.
+  >
   > **Pontos que costumam quebrar a cadeia:**
   > - **Threads trocadas:** `@Async`, `CompletableFuture` e executores próprios precisam de `ContextPropagatingTaskDecorator` (ou `ContextSnapshot` da `context-propagation`). Com virtual threads, o mesmo cuidado vale para `Executors.newVirtualThreadPerTaskExecutor()` criado à mão. No WebFlux, `Hooks.enableAutomaticContextPropagation()`.
   > - **Kafka:** a Saga e a Outbox (Aula 04) seguem assíncronas. Com `observation-enabled=true` no `KafkaTemplate` e no listener, o `traceparent` vai nos headers da mensagem. Na Outbox, gravo o `traceparent` numa coluna e o Debezium o devolve como header, para o trace não morrer no banco.
@@ -94,7 +96,7 @@
   > |---|---|---|---|
   > | Pool HikariCP | `hikaricp.connections.active` / `max` | **`hikaricp.connections.pending`** e `hikaricp.connections.acquire` (p99) | `hikaricp.connections.timeout` |
   > | Pool de conexões HTTP para o Pagamento e o Estoque | conexões em uso / máximo | **pedidos esperando conexão livre** (`httpcomponents.httpclient.pool.total.pending`) | timeouts de conexão e de leitura |
-  > | Threads (Tomcat ou executor) | `tomcat.threads.busy` / `max` | fila de requisições aceitas e não atendidas; com virtual threads, `jdk.VirtualThreadPinned` no JFR | requisições rejeitadas |
+  > | Conexões HTTP de entrada e virtual threads (Aula 02) | `tomcat.connections.current` / `tomcat.connections.config.max` (com `server.tomcat.mbeanregistry.enabled=true`) | `http.server.requests.active` crescendo; carriers presas (`jdk.VirtualThreadPinned` no JFR) | conexões recusadas com a fila `accept-count` cheia |
   > | Bulkhead e Circuit Breaker (Resilience4j, Aula 02) | chamadas simultâneas | `resilience4j.bulkhead.available.concurrent.calls` perto de 0 | chamadas rejeitadas, estado do circuito |
   > | JVM | heap usado, CPU | pausas de GC (`jvm.gc.pause`), memória perto do limite do pod | `OutOfMemoryError`, reinícios do pod |
   > | Kafka e Saga | — | **lag do consumidor**, pedidos parados no mesmo estado além do prazo | mensagens na DLQ |
@@ -132,7 +134,7 @@
   > **Problema do head sampling sozinho:** a decisão é tomada no início da requisição, antes de saber se ela vai travar. Com 1% de amostragem, 99% das requisições travadas seriam descartadas, e justamente o caso raro que precisamos investigar teria grande chance de sumir.
   >
   > **Desenho combinado:**
-  > 1. **Head sampling na origem, só para cortar ruído:** no SDK (`management.tracing.sampling.probability`, com amostrador *parent-based*), o `POST /checkout` e as chamadas da Saga são gerados a **100%**. Rotas de pouco valor (health checks, `/actuator/*`, consulta de catálogo) ficam em 1% ou são excluídas. Isso reduz o volume que chega ao Collector sem perder nenhum checkout.
+  > 1. **Head sampling na origem, só para cortar ruído:** no SDK, com `management.tracing.sampling.probability=1.0` e um `Sampler` customizado do OpenTelemetry (*parent-based*) que decide pela rota, o `POST /checkout` e as chamadas da Saga são gerados a **100%**. Rotas de pouco valor (health checks, `/actuator/*`, consulta de catálogo) ficam em 1% ou são excluídas. Isso reduz o volume que chega ao Collector sem perder nenhum checkout.
   > 2. **Tail sampling no OpenTelemetry Collector:** os spans chegam a um Collector *gateway*. Na frente dele, o `loadbalancing` exporter envia todos os spans do mesmo `trace_id` para a mesma instância, para que a decisão seja tomada sobre o trace completo. O processador `tail_sampling` espera o trace terminar (`decision_wait`) e aplica as políticas:
   >    - **Guardar 100%** dos traces com erro (`status_code = ERROR`), incluindo timeouts e cancelamentos.
   >    - **Guardar 100%** dos traces com duração acima de **1 s** (o limite do SLO).
@@ -142,7 +144,7 @@
   > **Custo:** no tráfego normal, quase tudo é rápido e com sucesso, então o backend recebe cerca de 2% a 5% dos traces, mais os problemáticos. O custo maior fica na memória do Collector, que guarda os traces durante a espera. Dimensiono pela fórmula `TPS × spans por trace × decision_wait` e escalo o Collector horizontalmente.
   >
   > **Como as requisições travadas não se perdem:**
-  > - Uma requisição travada **não fecha o span**, e um span aberto não é exportado. Por isso, todo ponto de espera tem timeout explícito (cliente HTTP, `TimeLimiter` da Aula 02, timeout de transação e `request-timeout` do servidor) **menor que o `decision_wait`**. Exemplo: Pagamento com timeout de 3 s, requisição com timeout de 10 s e `decision_wait` de 30 s. Quando o tempo esgota, o span fecha com `ERROR` e duração alta, e as duas políticas de 100% o guardam.
+  > - Uma requisição travada **não fecha o span**, e um span aberto não é exportado. Por isso, todo ponto de espera tem timeout explícito (cliente HTTP, `TimeLimiter` da Aula 02, timeout de transação e `request-timeout` do servidor) **menor que o `decision_wait`**. Exemplo (orçamento da Aula 02): consultas síncronas com timeout de 1 s, `POST /checkout` com 3 s, chamada ao PSP com prazo total de 10 s e `decision_wait` de 30 s. Quando o tempo esgota, o span fecha com `ERROR` e duração alta, e as duas políticas de 100% o guardam.
   > - O cancelamento pelo cliente também fecha o span: o Spring marca a observação como encerrada quando a conexão cai, e registro o evento `client.aborted`.
   > - Os logs têm o `trace_id` em todas as linhas e não passam por amostragem de traces, então mesmo um trace descartado pode ser reconstruído pelos logs.
 
@@ -157,7 +159,7 @@
   > - **Propagação do trace:** teste de integração com Testcontainers e WireMock no lugar do Pagamento. Chamo o Checkout e verifico que a requisição recebida pelo WireMock tem `traceparent` com o **mesmo `trace_id`** da requisição de entrada. Esse teste pega o `RestTemplate` criado à mão (seção 1).
   > - **Contrato do log:** capturo a saída com `OutputCaptureExtension` e valido que cada linha é JSON com `trace_id`, `span_id`, `service.version` e `event.action`.
   > - **LGPD:** o mesmo teste processa um pedido com CPF, e-mail e cartão fictícios e falha se algum desses valores, ou um padrão de CPF ou cartão, aparecer nos logs ou nos spans exportados (`InMemorySpanExporter` do OpenTelemetry).
-  > - **Timeout:** WireMock com `withFixedDelay(30_000)` no Pagamento. O teste confirma que o Checkout responde em até 3 s com erro controlado, que o contador de timeout aumenta e que o span termina com `ERROR`.
+  > - **Timeout:** WireMock com `withFixedDelay(30_000)` na pré-validação do Pagamento. O teste confirma que a consulta desiste em cerca de 1 s, que o fallback deixa o pedido seguir (`202` em menos de 3 s), que o contador de timeout aumenta e que o span do cliente HTTP termina com `ERROR`.
   > - **Métricas e labels:** chamo `/actuator/prometheus` e confirmo que existem os buckets do histograma e `http.server.requests.active`, e que nenhuma métrica tem label `customer_id`, `order_id` ou URL com valores.
   > - **Regras de alerta:** testes unitários das regras com `promtool test rules`. Uma série sintética com 5% das requisições acima de 1 s precisa disparar o alerta de *burn rate*; uma série saudável não pode disparar.
   >

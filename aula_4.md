@@ -30,7 +30,7 @@
   > - **Disponibilidade multiplicada:** a transação só conclui se todos estiverem no ar. Três serviços com 99,9% cada resultam em ~99,7% para o checkout, e a latência passa a ser a do participante mais lento.
   > - **Acoplamento:** os serviços perdem autonomia de deploy, de escala e de escolha de banco.
   >
-  > **Conclusão (CAP):** entre bancos autônomos ligados por rede, a escolha é disponibilidade com **consistência eventual**. Cada passo é uma transação ACID local, e a consistência global vem de uma **Saga** com ações compensatórias. A integridade financeira continua garantida porque toda falha tem um caminho de volta definido e automático.
+  > **Conclusão (CAP):** entre bancos autônomos ligados por rede, a escolha é disponibilidade com **consistência eventual**. Cada passo é uma transação ACID local, e a consistência global vem de uma **Saga** com ações compensatórias. A integridade financeira continua garantida porque toda falha tem um caminho de volta definido e automático. Isso não contradiz a Aula 03: **dentro** de cada serviço, o banco continua CP e ACID (dinheiro e estoque nunca ficam inconsistentes localmente); a consistência eventual vale só **entre** serviços, e cada passo dela tem compensação.
 
 ### 1.2 O Modelo de Coordenação da Saga
 
@@ -47,6 +47,13 @@
   > - A chave da mensagem é o `orderId`: todas as mensagens de um pedido caem na mesma partição, o que preserva a ordem.
   > - **Por que não síncrono (HTTP):** a 5.000 TPS, uma cadeia de chamadas segura threads e conexões enquanto espera, e a lentidão de um serviço se propaga para o checkout (o problema tratado na Aula 02). Além disso, o Pix já é assíncrono por natureza: a confirmação chega por webhook.
   > - O cliente recebe `202 Accepted` com o `orderId` e acompanha o status pelo modelo de leitura (seção 3.1).
+  >
+  > **Fronteira síncrono × assíncrono:**
+  > - **Síncrono (HTTP), só consultas que não mudam estado,** feitas dentro do `POST /checkout` antes de gravar o pedido, com os padrões da Aula 02 (timeout, Circuit Breaker, Bulkhead):
+  >   - Checkout → Estoque: disponibilidade e preço atual do SKU, para responder "esgotado" na hora. Se der timeout, o Checkout segue em frente, porque a reserva da Saga (o `UPDATE` condicional da Aula 03) é quem decide de verdade.
+  >   - Checkout → Pagamento: pré-validação do meio de pagamento e antifraude, sem cobrar. Se der timeout, o pedido segue e a análise é refeita no passo `CobrarPagamento`.
+  > - **Assíncrono (Kafka + Outbox):** todo comando que muda estado (`ReservarEstoque`, `CobrarPagamento`, `ConfirmarReserva`) e todas as compensações.
+  > - **Chamadas externas:** a chamada do Pagamento ao PSP é HTTP e usa os mesmos padrões da Aula 02, incluindo a chave de idempotência.
   >
   > **Como evito o "serviço Deus":**
   > - O orquestrador decide só a **sequência** e **o que desfazer**, nunca a regra de negócio. O Estoque decide se há unidade; o Pagamento decide antifraude, gateway e prazos. O orquestrador só reage a "sucesso" ou "falha".
@@ -86,7 +93,7 @@
   > 1. **Checkout:** recebe `POST /checkout` com `Idempotency-Key` (Aula 02). Na mesma transação local, grava o pedido (`CRIADO`), a `saga_instance` e o comando `ReservarEstoque` na tabela outbox (seção 2.2). Responde `202 Accepted` com o `orderId`. Estado: `RESERVANDO_ESTOQUE`.
   > 2. **Estoque:** executa o `UPDATE` condicional da Aula 03 (`disponivel >= :qtd`), cria a reserva com prazo de 10 min e responde `EstoqueReservado`.
   > 3. **Checkout:** passa para `AGUARDANDO_PAGAMENTO` e envia `CobrarPagamento`.
-  > 4. **Pagamento:** gera a cobrança Pix (com a própria chave de idempotência) e devolve o QR Code ao cliente. Quando o webhook do PSP confirma o pagamento, grava `PAGO` e responde `PagamentoAprovado`.
+  > 4. **Pagamento:** gera a cobrança Pix (com a própria chave de idempotência) e publica o evento `CobrancaPixEmitida` com o QR Code. O modelo de leitura entrega o QR Code ao aplicativo por SSE (seção 3.1). Quando o webhook do PSP confirma o pagamento, grava `PAGO` e responde `PagamentoAprovado`.
   > 5. **Checkout:** passa para `CONFIRMANDO_ESTOQUE` e envia `ConfirmarReserva`.
   > 6. **Estoque:** converte a reserva em baixa definitiva e responde `ReservaConfirmada`.
   > 7. **Checkout:** passa para `CONCLUIDO` e publica `PedidoConcluido`, consumido por logística, notificação e pelo modelo de leitura.
@@ -121,8 +128,8 @@
   >   BEGIN;
   >   UPDATE saga_instance SET estado = 'ESTORNANDO_PAGAMENTO', version = version + 1
   >    WHERE order_id = :id AND version = :v;
-  >   INSERT INTO outbox (id, aggregate_id, type, payload)
-  >   VALUES (:uuidv7, :id, 'EstornarPagamento', :json);
+  >   INSERT INTO outbox (id, aggregate_id, type, payload, traceparent)
+  >   VALUES (:uuidv7, :id, 'EstornarPagamento', :json, :traceparent);
   >   COMMIT;
   >   ```
   > - **Publicação (relay):** o **Debezium** lê o WAL do PostgreSQL (CDC) e publica a linha da outbox no Kafka com o *Outbox Event Router*. O código do serviço nem conhece o Kafka. Alternativa sem Debezium: um publicador agendado que lê a outbox com `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 500`, publica e marca como enviado (ou o *Event Publication Registry* do Spring Modulith).

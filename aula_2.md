@@ -9,7 +9,7 @@
   > Escolhi **Spring MVC com Virtual Threads** (Java 25, `spring.threads.virtual.enabled=true`) por três motivos:
   >
   > 1. **Muitas requisições sem muitas threads do sistema:** cada requisição roda numa virtual thread, que custa poucos KB. Enquanto espera o parceiro, ela é desmontada da thread do sistema (*carrier*), e a JVM usa cerca de uma carrier por núcleo. As 10 mil requisições esperando não ocupam 10 mil threads do sistema operacional.
-  > 2. **Código imperativo e ecossistema completo:** JDBC/HikariCP, JPA (`@Version`/`@Lock` da Aula 03), `@Transactional`, Flyway, `RestClient` e Resilience4j por anotações. Stack traces legíveis e depuração normal.
+  > 2. **Código imperativo e ecossistema completo:** JDBC/HikariCP, JPA (`@Version`/`@Lock` da Aula 03), `@Transactional`, Flyway, `RestClient` (sobre o Apache HttpClient 5, com pool de conexões limitado por destino e métricas no Micrometer) e Resilience4j por anotações. Stack traces legíveis e depuração normal.
   > 3. **Java 24+ (JEP 491):** `synchronized` não prende mais a virtual thread à carrier, o que eliminou a principal causa de *pinning* das versões 21 a 23.
   >
   > **Por que não WebFlux:** a vantagem do WebFlux era não bloquear threads. Com virtual threads, bloquear ficou barato, e essa vantagem deixa de existir num fluxo de pedido e resposta como o checkout. O WebFlux exigiria R2DBC (sem JPA), código `Mono`/`Flux` mais difícil de ler e depurar, e cuidado constante para não bloquear o event loop. Ele continua melhor para streaming com muitas conexões longas e backpressure de ponta a ponta, o que não é o caso aqui.
@@ -28,9 +28,11 @@ Dependemos de uma API terceira instável. Quais recursos do padrão de resiliên
   Quais padrões (Circuit Breaker, TimeLimiter, RateLimiter, Bulkhead, Retry) você implementaria na chamada para o Parceiro de Pagamentos? Por que?
   > Vou usar **os cinco padrões** (com Resilience4j), cada um contra um tipo diferente de problema. Os valores abaixo são um ponto de partida e devem ser ajustados com testes de carga.
   >
+  > Esses padrões se aplicam a toda chamada HTTP síncrona do fluxo: do Pagamento ao PSP e das consultas síncronas do Checkout ao Estoque e ao Pagamento (fronteira definida na Aula 04). Os comandos da Saga trafegam pelo Kafka e têm resiliência própria (Aula 04, seção 2.2).
+  >
   > | Padrão | Problema que resolve | Configuração inicial |
   > |---|---|---|
-  > | **TimeLimiter** (timeout) | Parceiro lento prendendo conexões indefinidamente | `connectTimeout` de 1 s e `readTimeout` de 3 s no `RestClient`; TimeLimiter do Resilience4j como limite da operação inteira |
+  > | **TimeLimiter** (timeout) | Parceiro lento prendendo conexões indefinidamente | `connectTimeout` de 1 s e `readTimeout` de 3 s no `RestClient`; TimeLimiter de 3 s **por tentativa** (fica dentro do Retry) |
   > | **Circuit Breaker** | Continuar chamando um parceiro que já está fora do ar | Abre com 50% de falhas **ou** 50% de chamadas lentas (> 2 s) em uma janela de 100 chamadas; fica aberto 30 s; em seguida libera 10 chamadas de teste (half-open) |
   > | **Bulkhead** | Uma dependência lenta consumir todos os recursos da aplicação | Máximo de 200 chamadas simultâneas ao parceiro; as demais falham rápido |
   > | **RateLimiter** | Ultrapassar a cota contratada com o parceiro (e receber HTTP 429) | Limite igual à cota do contrato, por exemplo 500 req/s |
@@ -40,26 +42,36 @@ Dependemos de uma API terceira instável. Quais recursos do padrão de resiliên
   >
   > **Ordem de aplicação** (de fora para dentro, padrão do Resilience4j): `Retry → CircuitBreaker → RateLimiter → TimeLimiter → Bulkhead → chamada ao parceiro`. Assim, cada nova tentativa passa de novo pelo Circuit Breaker, e quando o circuito está aberto a chamada falha imediatamente, sem novas tentativas.
   >
-  > **Fallback:** quando o circuito está aberto ou o resultado é incerto (timeout depois de todas as tentativas), o sistema **não** confirma nem cancela a compra. O pedido fica com status `PAGAMENTO_PENDENTE`, a API responde `202 Accepted` e um processo de **reconciliação** (webhook do parceiro ou consulta periódica pelo status) define o resultado final. Se o circuito estiver aberto antes de qualquer tentativa de cobrança, a API responde `503` com o header `Retry-After`.
+  > **Orçamento de tempo (cada camada desiste antes da camada de fora):**
+  >
+  > | Camada | Limite | Observação |
+  > |---|---|---|
+  > | Consultas síncronas do Checkout ao Estoque e ao Pagamento (Aula 04) | `readTimeout` de 1 s, sem Retry, em paralelo | Têm fallback, então repetir não vale o tempo gasto |
+  > | `POST /checkout` no servidor | `request-timeout` de 3 s | O cliente recebe `202` ou um erro controlado, nunca uma espera indefinida |
+  > | Aplicativo | timeout de 10 s | Sempre maior que o do servidor, para que a falha apareça do lado do servidor (métrica, log, trace) |
+  > | Pagamento → PSP (fora do caminho do usuário) | 3 s por tentativa × 3 tentativas + backoff ≈ 9,6 s; prazo total de 10 s | Esgotado o prazo, o pedido fica `PAGAMENTO_PENDENTE` e vai para reconciliação |
+  > | Tail sampling (Aula 06) | `decision_wait` de 30 s | Maior que qualquer prazo acima, para que o span sempre feche antes da decisão |
+  >
+  > **Fallback:** quando o circuito está aberto ou o resultado é incerto (timeout depois de todas as tentativas), o sistema **não** confirma nem cancela a compra. O pedido fica com status `PAGAMENTO_PENDENTE` (na máquina de estados da Aula 04, ele continua em `AGUARDANDO_PAGAMENTO` até a reconciliação), a API responde `202 Accepted` e um processo de **reconciliação** (webhook do parceiro ou consulta periódica pelo status) define o resultado final. Se o circuito estiver aberto antes de qualquer tentativa de cobrança, a API responde `503` com o header `Retry-After`.
 
 - **Proteção contra Duplicidade:**
   Como a `Idempotency-Key` será utilizada na requisição do Checkout para evitar cobranças duplas? Qual o ciclo de vida dessa chave?
-  > **Uso:** o **cliente** (front-end ou app) gera um UUID v4 para cada **intenção de compra** e o envia no header `Idempotency-Key: <uuid>`. Se o usuário clicar duas vezes, a rede falhar ou o app reenviar a requisição, a chave continua a mesma. O servidor guarda a chave no **Redis** e repassa o mesmo valor ao parceiro de pagamento, que assim também não cobra duas vezes.
+  > **Uso:** o **cliente** (front-end ou app) gera um UUID v4 para cada **intenção de compra** e o envia no header `Idempotency-Key: <uuid>`. Se o usuário clicar duas vezes, a rede falhar ou o app reenviar a requisição, a chave continua a mesma. O servidor registra a chave no **PostgreSQL**, na mesma transação que cria o pedido (fonte da verdade), usa o **Redis** só como atalho para respostas repetidas e repassa o mesmo valor ao parceiro de pagamento, que assim também não cobra duas vezes.
   >
   > **Ciclo de vida da chave:**
   >
   > 1. **Recebimento:** o servidor valida o header (obrigatório, formato UUID) e calcula um hash do corpo da requisição.
-  > 2. **Reserva:** faz um `SET idem:{clienteId}:{chave} PROCESSANDO NX EX 86400` no Redis. A operação é atômica: só a primeira requisição consegue gravar.
-  >    - **Chave nova:** segue para a cobrança.
-  >    - **Chave já existe com status `PROCESSANDO`:** responde `409 Conflict` (outra requisição igual está em andamento).
-  >    - **Chave já existe com status `CONCLUIDO`:** devolve a **mesma resposta salva** (status HTTP e corpo), sem cobrar de novo.
+  > 2. **Reserva:** antes, um `GET idem:{clienteId}:{chave}` no Redis funciona como atalho: se a resposta final já estiver lá, ela é devolvida na hora, sem tocar no banco. Se não estiver, na mesma transação que cria o pedido (`CRIADO`, Aula 04), faz `INSERT INTO idempotencia (cliente_id, chave, hash_corpo, status)` com chave primária `(cliente_id, chave)`. Só a primeira requisição consegue gravar. Uma violação da chave significa repetição, e o registro existente decide a resposta:
+  >    - **Inserção bem-sucedida:** segue para a cobrança.
+  >    - **Registro com status `PROCESSANDO`:** responde `409 Conflict` (outra requisição igual está em andamento).
+  >    - **Registro com status `CONCLUIDO`:** devolve a **mesma resposta salva** (status HTTP e corpo), sem cobrar de novo.
   >    - **Mesma chave com corpo diferente** (o hash não bate): responde `422 Unprocessable Entity`, porque é uso indevido da chave.
   > 3. **Processamento:** chama o parceiro com a mesma chave, passando pelos padrões de resiliência acima.
-  > 4. **Conclusão:** atualiza o registro para `CONCLUIDO` com a resposta final, ou `PENDENTE` em caso de resultado incerto, mantendo o TTL.
+  > 4. **Conclusão:** atualiza o registro no PostgreSQL para `CONCLUIDO` com a resposta final, ou `PENDENTE` em caso de resultado incerto, e copia a resposta final para o Redis (TTL de 24 h).
   > 5. **Falha antes da cobrança:** se ocorrer um erro que comprovadamente aconteceu **antes** de chamar o parceiro (por exemplo, erro de validação), a chave é removida para permitir uma nova tentativa.
-  > 6. **Expiração:** a chave expira após **24 horas** (TTL). Depois disso, o mesmo UUID seria tratado como uma nova compra; por isso, o cliente nunca reutiliza chaves.
+  > 6. **Expiração:** registros com mais de **24 horas** são removidos por um job (ou por partição diária), e o TTL do Redis é o mesmo. Depois disso, o mesmo UUID seria tratado como uma nova compra; por isso, o cliente nunca reutiliza chaves.
   >
-  > **Segurança extra:** a chave no Redis inclui o `clienteId`, para que um cliente não consiga colidir com a chave de outro. Além disso, o pedido tem uma restrição `UNIQUE` em `idempotency_key` no Postgres, como segunda barreira caso o Redis perca dados.
+  > **Segurança extra:** a chave primária `(cliente_id, chave)` impede que um cliente colida com a chave de outro. Se o Redis perder dados (failover, despejo de memória), o único efeito é uma consulta a mais ao banco, nunca uma cobrança duplicada, seguindo a regra da Aula 03: dado eventual não decide dinheiro.
 
 ## 3. Os Edge Cases (Engenharia do Caos)
 
@@ -68,15 +80,14 @@ Cole aqui as 3 perguntas de risco que você formulou e defina como a arquitetura
 1. **E se...** o parceiro **cobrar o cliente, mas a resposta se perder** no caminho (timeout ou queda de conexão)?
    - **Resposta do Sistema:** a API não sabe se houve cobrança, então **não pode assumir sucesso nem falha**.
      - O Retry repete a chamada com a **mesma `Idempotency-Key`**. Se a cobrança já tinha acontecido, o parceiro devolve o resultado original em vez de cobrar de novo.
-     - Se todas as tentativas falharem, o pedido fica `PAGAMENTO_PENDENTE`, a chave fica `PENDENTE` no Redis e a API responde `202 Accepted`.
-     - A **reconciliação** resolve o caso: o sistema recebe o webhook do parceiro ou consulta o status do pagamento pela chave (por exemplo, a cada 1 minuto, por até 24 h) e atualiza o pedido para `PAGO` ou `FALHOU`. O cliente é notificado do resultado.
+     - Se todas as tentativas falharem, o pedido fica `PAGAMENTO_PENDENTE`, o registro de idempotência fica `PENDENTE` e a API responde `202 Accepted`.
+     - A **reconciliação** resolve o caso: o sistema recebe o webhook do parceiro ou consulta o status do pagamento pela chave (por exemplo, a cada 1 minuto, por até 24 h) e atualiza o **registro de pagamento** para `PAGO` ou `FALHOU`; a Saga então avança o pedido para `CONCLUIDO` ou o cancela (Aula 04). O cliente é notificado do resultado.
      - Se a mesma requisição for reenviada nesse meio-tempo, recebe o status atual (`PENDENTE`), nunca uma nova cobrança.
-2. **E se...** o **Redis** usado para controlar a idempotência **ficar fora do ar**?
-   - **Resposta do Sistema:** a regra é **não cobrar sem garantia de idempotência** (fail closed: na dúvida, bloquear).
-     - A API passa a usar a segunda barreira: a restrição `UNIQUE` em `idempotency_key` na tabela de pedidos do Postgres (via JDBC). O pedido é inserido **antes** de chamar o parceiro; se a chave já existir, a inserção falha e a API devolve o pedido existente em vez de cobrar.
-     - Se o Postgres também estiver indisponível, a API responde `503 Service Unavailable` com `Retry-After`, e o cliente reenvia depois com a mesma chave.
-     - As chamadas ao Redis também têm timeout curto (por exemplo, 200 ms) e um Circuit Breaker próprio, para que a queda do Redis não deixe as requisições esperando.
-     - Um alerta é disparado para o time de plantão, porque o sistema está funcionando com menos proteção.
+2. **E se...** o **Redis** usado como atalho de idempotência **ficar fora do ar**?
+   - **Resposta do Sistema:** a proteção continua inteira, porque quem garante a idempotência é o PostgreSQL. O sistema fica só um pouco mais lento.
+     - As chamadas ao Redis têm timeout curto (200 ms) e um Circuit Breaker próprio. Com o circuito aberto, o atalho é pulado e todas as requisições vão direto ao `INSERT` no PostgreSQL.
+     - Se o PostgreSQL também estiver indisponível, a regra é **não cobrar sem garantia de idempotência** (fail closed): `503 Service Unavailable` com `Retry-After`, e o cliente reenvia depois com a mesma chave.
+     - Um alerta é disparado para o plantão por **perda de desempenho**, não por perda de proteção.
 3. **E se...** houver um **pico de 3x o tráfego** (Black Friday, 30 mil usuários) **ao mesmo tempo em que o parceiro fica lento**?
    - **Resposta do Sistema:** o sistema deve **degradar de forma controlada**, sem cair por completo.
      - O **TimeLimiter** encerra as chamadas lentas em 3 s, para que as conexões não se acumulem.
@@ -106,7 +117,7 @@ Cole aqui as 3 perguntas de risco que você formulou e defina como a arquitetura
   >
   > **2. O timeout não deixa a thread presa:**
   > - Simular **latência de 10 s** no parceiro com `withFixedDelay(10_000)` no WireMock (ou um *toxic* de latência no Toxiproxy).
-  > - Verificar que a chamada termina com erro de timeout em aproximadamente **3 s**, e não em 10 s. No teste unitário, configurar um timeout curto (ex.: 300 ms) para o teste não levar 3 s reais.
+  > - Verificar que **cada tentativa** termina em aproximadamente **3 s** e que a operação inteira, com os retries, termina em no máximo **10 s**, e não em 30 s. No teste unitário, configurar um timeout curto (ex.: 300 ms) para o teste não levar 3 s reais.
   > - Verificar que a conexão HTTP foi encerrada e devolvida ao pool (métricas do pool de conexões do cliente HTTP).
   > - Rodar os testes com o **JFR** gravando: qualquer evento `jdk.VirtualThreadPinned` acima de 20 ms faz o teste falhar.
   > - No teste de carga com o parceiro lento, verificar pelo Micrometer/Actuator que as carriers continuam estáveis (aproximadamente o número de núcleos), que as virtual threads ativas ficam limitadas pelo Bulkhead e que a memória não cresce sem limite.
